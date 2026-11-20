@@ -1,0 +1,8 @@
+Trace's LGPL PyAV build (tools/pyav-lgpl/README.md)
+run: https://github.com/damo888/clip-tracker/actions/runs/44400556323 (commit c05bf257c7d668be99a20ec15a3cd62ba864e1ea)
+runner image: win25-vs2026 20261103.298.1
+PyAV-Org/pyav-ffmpeg 9.0.2-4 6f3eed7b641b0095a965786c182de03f9aefcc59, edited by no_x264.py
+PyAV-Org/PyAV v19.0.2 a4ad0133b13eb84067dc6e8105eb1fc8f8b93c4f, ffmpeg-latest.json (9.0.2-1) pointed at our tarball by use_tarball.py
+sha256:
+8fe3584861f2d987d3a8b803ab2435dd5fedf59f89404d6d05cf1ae2e3f278bb *av-19.0.2-cp312-abi3-win_amd64.whl
+e3092ffc889f0ed9c39820fe54d3aeeac63285203dd9d141d8a2e68e7bbb9b1e *ffmpeg-windows-x86_64.tar.gz

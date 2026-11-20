@@ -1,0 +1,288 @@
+# PitchCraft Trace's own PyAV wheel, built without x264 and x265 (both GPL). See README.md and tools/pyav-lgpl/RECIPE.md.
+# The same workflow as in Trace's private repo (tools/pyav-lgpl/public-repo is where this copy is kept).
+#
+# Four jobs, so a failure says where: sources (upstream's "fan" job), ffmpeg (upstream's Windows x86_64 build of
+# FFmpeg, with tools/pyav-lgpl/no_x264.py applied), wheel (PyAV's cp312 win_amd64 wheel on that FFmpeg) and check
+# (installs the wheel in a clean venv on a fresh runner, proves x264 and x265 are gone, uploads the result).
+# The steps marked "as upstream" are copied from pyav-ffmpeg's build-ffmpeg.yml and PyAV's tests.yml at the
+# pinned SHAs below.
+
+name: pyav-lgpl
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/pyav-lgpl.yml
+      - tools/pyav-lgpl/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pyav-lgpl-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # FFmpeg is built from pyav-ffmpeg 9.0.2-4. PyAV v19.0.2's scripts/ffmpeg-latest.json names 9.0.2-1 (the same
+  # FFmpeg 9.0.2), which can no longer be rebuilt as pinned: its lame source moved (basswood-io/lamer became bwlame)
+  # and GitHub's archive of it changed hash. use_tarball.py checks PyAV names exactly PYAV_PINS_FFMPEG_TAG.
+  # For a new PyAV, set all five together (tools/pyav-lgpl/README.md).
+  PYAV_FFMPEG_TAG: 9.0.2-4
+  PYAV_FFMPEG_SHA: 6f3eed7b641b0095a965786c182de03f9aefcc59
+  PYAV_PINS_FFMPEG_TAG: 9.0.2-1
+  PYAV_TAG: v19.0.2
+  PYAV_SHA: a4ad0133b13eb84067dc6e8105eb1fc8f8b93c4f
+
+jobs:
+  sources:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check the tags still point at the pinned SHAs
+        run: |
+          check() {
+            got=$(git ls-remote "https://github.com/$1" "refs/tags/$2" "refs/tags/$2^{}" | tail -n 1 | cut -f 1)
+            echo "$1 $2: $got (pinned $3)"
+            [ "$got" = "$3" ] || { echo "::error::$1 tag $2 is $got, not the pinned $3"; exit 1; }
+          }
+          check PyAV-Org/pyav-ffmpeg "$PYAV_FFMPEG_TAG" "$PYAV_FFMPEG_SHA"
+          check PyAV-Org/PyAV "$PYAV_TAG" "$PYAV_SHA"
+      - uses: actions/checkout@v7
+        with:
+          repository: PyAV-Org/pyav-ffmpeg
+          ref: ${{ env.PYAV_FFMPEG_SHA }}
+          persist-credentials: false
+      # As upstream (the "fan" job).
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Make cache file
+        run: python scripts/cache.py
+      - name: Cache tarballs
+        id: cache-tarballs
+        uses: actions/cache@v6
+        with:
+          path: source
+          key: tarballs-${{ hashFiles('cache.txt') }}
+      - name: Grab
+        if: steps.cache-tarballs.outputs.cache-hit != 'true'
+        run: python scripts/grab.py
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: deps
+          path: source/*
+          if-no-files-found: error
+          retention-days: 7
+
+  ffmpeg:
+    needs: sources
+    runs-on: windows-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: trace
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: PyAV-Org/pyav-ffmpeg
+          ref: ${{ env.PYAV_FFMPEG_SHA }}
+          path: pyav-ffmpeg
+          persist-credentials: false
+      # As upstream (the "build" job, windows-latest x86_64).
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Get sources
+        uses: actions/download-artifact@v8
+        with:
+          name: deps
+          path: pyav-ffmpeg/source
+      - uses: msys2/setup-msys2@v2
+        with:
+          install: >-
+            base-devel
+            openssl-devel
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-nasm
+          msystem: MINGW64
+          path-type: inherit
+      # Ours.
+      - name: Leave out x264 and x265
+        run: python trace/tools/pyav-lgpl/no_x264.py pyav-ffmpeg
+      # As upstream.
+      - name: Build FFmpeg
+        working-directory: pyav-ffmpeg
+        env:
+          CIBW_ARCHS: AMD64
+          CIBW_BEFORE_BUILD_WINDOWS: python scripts\build-ffmpeg.py C:\cibw\vendor
+          CIBW_BUILD: cp312-*
+          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: delvewheel repair --add-path C:\cibw\vendor\bin -w {dest_dir} {wheel}
+          CIBW_TEST_COMMAND: python -c "import dummy"
+        run: |
+          which python pip
+          pip install cibuildwheel delvewheel
+          pip freeze
+          cibuildwheel --output-dir output
+          rm -f output/*.whl
+          ls -l output
+      # Ours.
+      - name: Check the FFmpeg tarball
+        run: |
+          python trace/tools/pyav-lgpl/check.py files pyav-ffmpeg/output/ffmpeg-windows-x86_64.tar.gz
+          sha256sum pyav-ffmpeg/output/ffmpeg-windows-x86_64.tar.gz
+      - name: Upload FFmpeg
+        uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg
+          path: pyav-ffmpeg/output/ffmpeg-windows-x86_64.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload build logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg-logs
+          path: |
+            pyav-ffmpeg/build/**/config.log
+            pyav-ffmpeg/build/**/CMakeConfigureLog.yaml
+            pyav-ffmpeg/build/**/CMakeError.log
+            pyav-ffmpeg/build/**/meson-log.txt
+            pyav-ffmpeg/scripts/build-ffmpeg.py
+          if-no-files-found: ignore
+          retention-days: 7
+
+  wheel:
+    needs: ffmpeg
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: trace
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: PyAV-Org/PyAV
+          ref: ${{ env.PYAV_SHA }}
+          path: PyAV
+          persist-credentials: false
+      - name: Get FFmpeg
+        uses: actions/download-artifact@v8
+        with:
+          name: ffmpeg
+          path: ${{ runner.temp }}/ffmpeg
+      # As upstream (the "package-wheel" job, windows-latest AMD64).
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          activate-environment: true
+          python-version: "3.14"
+      # Ours.
+      - name: Use our FFmpeg tarball
+        run: python trace/tools/pyav-lgpl/use_tarball.py PyAV "${{ runner.temp }}/ffmpeg/ffmpeg-windows-x86_64.tar.gz" --tag "$PYAV_FFMPEG_TAG" --pyav-names "$PYAV_PINS_FFMPEG_TAG"
+      # As upstream, but one wheel (cp312 win_amd64) and no tests here: several of PyAV's tests call libx264
+      # directly, so they run in the check job instead, where a failure is reported without stopping the run.
+      - name: Build wheel
+        working-directory: PyAV
+        env:
+          CIBW_ARCHS: AMD64
+          CIBW_BEFORE_BUILD_WINDOWS: python scripts\fetch-vendor.py --config-file scripts\ffmpeg-latest.json C:\cibw\vendor
+          CIBW_ENVIRONMENT_WINDOWS: INCLUDE=C:\\cibw\\vendor\\include LIB=C:\\cibw\\vendor\\lib PYAV_SKIP_TESTS=unicode_filename
+          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: delvewheel repair --add-path C:\cibw\vendor\bin -w {dest_dir} {wheel}
+          CIBW_BUILD: cp312-win_amd64
+          CIBW_BUILD_FRONTEND: uv
+          CIBW_TEST_SKIP: "*"
+        run: |
+          uv pip install cibuildwheel delvewheel
+          uv pip freeze
+          cibuildwheel --output-dir dist
+          ls -l dist
+      # Ours.
+      - name: Check the wheel's files
+        run: |
+          python trace/tools/pyav-lgpl/check.py files PyAV/dist/*.whl
+          sha256sum PyAV/dist/*.whl
+      - name: Upload wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheel
+          path: PyAV/dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+  check:
+    needs: [ffmpeg, wheel]
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: trace
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: PyAV-Org/PyAV
+          ref: ${{ env.PYAV_SHA }}
+          path: PyAV
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheel
+          path: out
+      - uses: actions/download-artifact@v8
+        with:
+          name: ffmpeg
+          path: out
+      - name: Install the wheel in a clean venv
+        run: |
+          python -m venv venv
+          venv/Scripts/python -m pip install --no-deps out/*.whl
+          venv/Scripts/python -m pip list
+      - name: Check av has no x264 or x265
+        run: venv/Scripts/python -I trace/tools/pyav-lgpl/check.py av --version "${PYAV_TAG#v}"
+      # PyAV's own tests, as upstream runs them. Some call libx264 directly and are expected to fail; read the
+      # summary, but a failure here does not stop the run.
+      - name: PyAV's tests (report only)
+        continue-on-error: true
+        env:
+          PYAV_SKIP_TESTS: unicode_filename
+        run: |
+          venv/Scripts/python -m pip install pytest numpy
+          mv PyAV/av PyAV/av.disabled
+          cd PyAV && ../venv/Scripts/python -m pytest tests -q -rfE -p no:cacheprovider
+      - name: Gather the result
+        run: |
+          cp trace/tools/pyav-lgpl/*.py trace/tools/pyav-lgpl/RECIPE.md out/
+          {
+            echo "Trace's LGPL PyAV build (tools/pyav-lgpl/RECIPE.md)"
+            echo "run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID (commit $GITHUB_SHA)"
+            echo "runner image: $ImageOS $ImageVersion"
+            echo "PyAV-Org/pyav-ffmpeg $PYAV_FFMPEG_TAG $PYAV_FFMPEG_SHA, edited by no_x264.py"
+            echo "PyAV-Org/PyAV $PYAV_TAG $PYAV_SHA, ffmpeg-latest.json ($PYAV_PINS_FFMPEG_TAG) pointed at our tarball by use_tarball.py"
+            echo "sha256:"
+            (cd out && sha256sum *.whl *.tar.gz)
+          } > out/SOURCES.txt
+          cat out/SOURCES.txt
+      - name: Upload the result
+        uses: actions/upload-artifact@v7
+        with:
+          name: pyav-lgpl-${{ env.PYAV_TAG }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 90
